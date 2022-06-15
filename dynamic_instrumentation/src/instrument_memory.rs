@@ -8,8 +8,8 @@ use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_index::vec::IndexVec;
 use rustc_middle::mir::visit::{PlaceContext, Visitor};
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, Body, CastKind, Constant, Local, LocalDecl, Location, Operand,
-    Place, PlaceElem, PlaceRef, ProjectionElem, Rvalue, SourceInfo, SourceScopeData, Statement,
+    BasicBlock, BasicBlockData, BorrowKind, Body, CastKind, Constant, Local, LocalDecl, Location, Mutability,
+    Operand, Place, PlaceElem, ProjectionElem, Rvalue, SourceInfo, SourceScopeData, Statement,
     StatementKind, Terminator, TerminatorKind, START_BLOCK,
 };
 use rustc_middle::ty::{self, ParamEnv, TyCtxt};
@@ -437,32 +437,50 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                         },
                     );
                 }
-            } else if value.ty(&self.body.local_decls, self.tcx).is_region_ptr() {
-                /*
-                    Stephen: uncomment below to get an example of following error:
+            } else if value.ty(&self.body.local_decls, self.tcx).is_region_ptr() { // Rhs is a ref
+                /// Used to strip initital deref from projection sequences
+                fn pop_one_projection<'tcx>(p: &Place<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Place<'tcx>> {
+                    if p.projection.is_empty() {
+                        return None;
+                    }
+                    Some(Place {
+                        local: p.local,
+                        projection: tcx.intern_place_elems(&p.projection[..p.projection.len() - 1]),
+                    })
+                }
+                // For mutable borrows (let _n = &mut place), create a parallel binding that takes
+                // a raw pointer to the same place, without involving _n
+                if let Rvalue::Ref(_, BorrowKind::Mut {..}, p) = value {
+                    // We do not increment the statement index because we want to take a raw ptr
+                    // prior to the existing stmt that takes a mutable pointer
+                    //location.statement_index += 1;
 
-                    error: internal compiler error: compiler/rustc_borrowck/src/borrow_set.rs:252:17:
-                    found two uses for 2-phase borrow temporary _9: bb45[0] and bb46[1]
-                    --> ../analysis/test/src/pointers.rs:162:16
-                        |
-                    162 |     for arg in ::std::env::args() {
-                        |                ^^^^^^^^^^^^^^^^^^
-                */
-
-                // location.statement_index += 1;
-                // if let Some(p) = rv_place(value) {
-                //     self.add_instrumentation(
-                //         location,
-                //         ref_copy_fn,
-                //         vec![Operand::Copy(dest)],
-                //         false,
-                //         false,
-                //         EventMetadata {
-                //             source: Some(to_mir_place(&p)),
-                //             destination: Some(to_mir_place(&dest)),
-                //         },
-                //     );
-                // }
+                    // Remove outer deref if present, so we turn `&mut *x` into `addr_of!(x)` rather
+                    // than `addr_of!(*x)`
+                    let arg = match p.iter_projections().last() {
+                        Some((_, ProjectionElem::Deref)) => {
+                            let sans_proj = pop_one_projection(p, self.tcx.clone())
+                                .expect("expected but did not find deref projection");
+                            Operand::Copy(sans_proj)
+                        },
+                        _ => Operand::Copy(p.clone()),
+                    };
+                    // Note that we pass `arg` here that may be entirely unrelated to a reference,
+                    // so `do_instrumentation` now needs to be able to take raw ptrs to arbitrary
+                    // types
+                    self.add_instrumentation(
+                        location,
+                        ref_copy_fn,
+                        vec![arg],
+                        false,
+                        false,
+                        EventMetadata {
+                            source: Some(to_mir_place(&p)),
+                            destination: Some(to_mir_place(&dest)),
+                            transfer_kind: TransferKind::None,
+                        },
+                    );
+                }
             }
         }
         self.super_statement(statement, location);
@@ -859,32 +877,57 @@ fn cast_ptr_to_usize<'tcx>(
     arg: &Operand<'tcx>,
 ) -> Option<(Vec<Statement<'tcx>>, Operand<'tcx>)> {
     let arg_ty = arg.ty(locals, tcx);
+    println!("cast_ptr_to_usize arg_ty: {:?}", arg_ty);
     if !arg_ty.is_any_ptr() {
-        return None;
+        if arg_ty.is_integral() {
+            return None;
+        }
     }
 
     let mut new_stmts = vec![];
 
     let ptr_arg = if !arg_ty.is_unsafe_ptr() {
-        let ptr_ty = arg_ty.builtin_deref(false).unwrap();
-        let raw_ptr_ty = tcx.mk_ptr(ptr_ty);
-        let raw_ptr_local = locals.push(LocalDecl::new(raw_ptr_ty, DUMMY_SP));
-        let mut deref = arg
-            .place()
-            .expect("Can't get the address of a constant")
-            .clone();
-        let mut projs = Vec::with_capacity(deref.projection.len() + 1);
-        projs.extend(deref.projection);
-        projs.push(ProjectionElem::Deref);
-        deref.projection = tcx.intern_place_elems(&*projs);
-        let cast_stmt = Statement {
-            source_info: SourceInfo::outermost(DUMMY_SP),
-            kind: StatementKind::Assign(Box::new((
-                raw_ptr_local.into(),
-                Rvalue::AddressOf(ptr_ty.mutbl, deref),
-            ))),
+        let inner_ty = if arg_ty.is_region_ptr() {
+            arg_ty.builtin_deref(false).unwrap()
+        } else {
+            ty::TypeAndMut {
+                ty: arg_ty,
+                mutbl: Mutability::Not,
+            }
         };
-        new_stmts.push(cast_stmt);
+        let raw_ptr_ty = tcx.mk_ptr(inner_ty);
+        let raw_ptr_local = locals.push(LocalDecl::new(raw_ptr_ty, DUMMY_SP));
+        if arg_ty.is_region_ptr() {
+            let mut deref = arg
+                .place()
+                .expect("Can't get the address of a constant")
+                .clone();
+            let mut projs = Vec::with_capacity(deref.projection.len() + 1);
+            projs.extend(deref.projection);
+            projs.push(ProjectionElem::Deref);
+            deref.projection = tcx.intern_place_elems(&*projs);
+            let cast_stmt = Statement {
+                source_info: SourceInfo::outermost(DUMMY_SP),
+                kind: StatementKind::Assign(Box::new((
+                    raw_ptr_local.into(),
+                    Rvalue::AddressOf(inner_ty.mutbl, deref),
+                ))),
+            };
+            new_stmts.push(cast_stmt);
+        } else {
+            let arg_place = arg
+                .place()
+                .expect("Can't get the address of a constant")
+                .clone();
+            let addr_of_stmt = Statement {
+                source_info: SourceInfo::outermost(DUMMY_SP),
+                kind: StatementKind::Assign(Box::new((
+                    raw_ptr_local.into(),
+                    Rvalue::AddressOf(inner_ty.mutbl, arg_place),
+                ))),
+            };
+            new_stmts.push(addr_of_stmt);
+        }
         Operand::Move(raw_ptr_local.into())
     } else {
         arg.to_copy()
