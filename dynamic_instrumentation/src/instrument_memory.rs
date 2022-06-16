@@ -914,7 +914,7 @@ fn cast_ptr_to_usize<'tcx>(
                 ))),
             };
             new_stmts.push(cast_stmt);
-        } else {
+        } else if arg.place().is_some() {
             let arg_place = arg
                 .place()
                 .expect("Can't get the address of a constant")
