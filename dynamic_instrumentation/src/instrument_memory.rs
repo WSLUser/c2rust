@@ -101,7 +101,7 @@ struct InstrumentationPoint<'tcx> {
     metadata: EventMetadata,
 }
 
-struct FunctionInstrumenter<'a, 'tcx: 'a> {
+struct CollectFunctionInstrumentationPoints<'a, 'tcx: 'a> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
     runtime_crate_did: DefId,
@@ -109,7 +109,7 @@ struct FunctionInstrumenter<'a, 'tcx: 'a> {
     instrumentation_points: RefCell<Vec<InstrumentationPoint<'tcx>>>,
 }
 
-impl<'a, 'tcx: 'a> FunctionInstrumenter<'a, 'tcx> {
+impl<'a, 'tcx: 'a> CollectFunctionInstrumentationPoints<'a, 'tcx> {
     /// Queues insertion of a call to `func`
     ///
     /// The call will be inserted before the statement at index `statement_idx`
@@ -117,11 +117,11 @@ impl<'a, 'tcx: 'a> FunctionInstrumenter<'a, 'tcx> {
     /// the call will be inserted at the end of the block.
     ///
     /// `func` must not unwind, as it will have no cleanup destination.
-    fn add_instrumentation(
+    fn add_instrumentation_point(
         &self,
         loc: Location,
         func: DefId,
-        args: Vec<Operand<'tcx>>,
+        args: Vec<InstrumentationOperand<'tcx>>,
         is_cleanup: bool,
         after_call: bool,
         metadata: EventMetadata,
@@ -208,7 +208,7 @@ fn rv_place<'tcx>(rv: &'tcx Rvalue) -> Option<Place<'tcx>> {
     }
 }
 
-impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
+impl<'a, 'tcx: 'a> Visitor<'tcx> for CollectFunctionInstrumentationPoints<'a, 'tcx> {
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
         self.super_place(place, context, location);
         let field_fn = self
@@ -231,7 +231,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                         let field_fn = self
                             .find_instrumentation_def(Symbol::intern("ptr_field"))
                             .expect("Could not find pointer field hook");
-                        self.add_instrumentation(
+                        self.add_instrumentation_point(
                             location,
                             field_fn,
                             vec![
@@ -264,7 +264,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                         }
                         place_ref = cur_ref;
                     }
-                    self.add_instrumentation(
+                    self.add_instrumentation_point(
                         location,
                         store_fn,
                         vec![Operand::Copy(dest)],
@@ -277,7 +277,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                         },
                     );
                 } else {
-                    self.add_instrumentation(
+                    self.add_instrumentation_point(
                         location.clone(),
                         load_fn,
                         vec![Operand::Copy(place.local.into())],
@@ -326,7 +326,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                 if value.ty(&self.body.local_decls, self.tcx).is_unsafe_ptr() {
                     let mut loc = location;
                     loc.statement_index += 1;
-                    self.add_instrumentation(
+                    self.add_instrumentation_point(
                         loc,
                         store_value_fn,
                         vec![Operand::Copy(dest)],
@@ -345,7 +345,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                         if !p.is_indirect()
                             && p.ty(&self.body.local_decls, self.tcx).ty.is_unsafe_ptr()
                         {
-                            self.add_instrumentation(
+                            self.add_instrumentation_point(
                                 location.clone(),
                                 ptr_to_int_fn,
                                 vec![Operand::Copy(p.local.into())],
@@ -367,7 +367,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                         // we're dereferencing a pointer, the result of which is another pointer
                         let mut loc = location;
                         loc.statement_index += 1;
-                        self.add_instrumentation(
+                        self.add_instrumentation_point(
                             location,
                             load_value_fn,
                             vec![Operand::Copy(dest)],
@@ -380,7 +380,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                             },
                         );
                     } else {
-                        self.add_instrumentation(
+                        self.add_instrumentation_point(
                             location,
                             copy_fn,
                             vec![Operand::Copy(dest)],
@@ -396,7 +396,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                 } else if let Rvalue::Cast(_, p, _) = value {
                     location.statement_index += 1;
                     if p.ty(&self.body.local_decls, self.tcx).is_integral() {
-                        self.add_instrumentation(
+                        self.add_instrumentation_point(
                             location,
                             ptr_contrive_fn,
                             vec![Operand::Copy(dest)],
@@ -409,7 +409,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                             },
                         );
                     } else {
-                        self.add_instrumentation(
+                        self.add_instrumentation_point(
                             location,
                             copy_fn,
                             vec![Operand::Copy(dest)],
@@ -424,7 +424,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                     }
                 } else if let Rvalue::AddressOf(_, p) = value {
                     location.statement_index += 1;
-                    self.add_instrumentation(
+                    self.add_instrumentation_point(
                         location,
                         addr_local_fn,
                         vec![Operand::Copy(dest), make_const(self.tcx, p.local.as_u32())],
@@ -468,7 +468,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                     // Note that we pass `arg` here that may be entirely unrelated to a reference,
                     // so `do_instrumentation` now needs to be able to take raw ptrs to arbitrary
                     // types
-                    self.add_instrumentation(
+                    self.add_instrumentation_point(
                         location,
                         ref_copy_fn,
                         vec![arg],
@@ -524,7 +524,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                         if let Some(place) = arg.place() {
                             if self.body.local_decls[place.local].ty.is_unsafe_ptr() {
                                 println!("visiting terminator arg {:?}", place);
-                                self.add_instrumentation(
+                                self.add_instrumentation_point(
                                     location,
                                     arg_fn,
                                     vec![Operand::Copy(place)],
@@ -558,7 +558,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                                 .find_instrumentation_def(fn_name)
                                 .expect("Could not find instrumentation hook function");
 
-                            self.add_instrumentation(
+                            self.add_instrumentation_point(
                                 location,
                                 func_def_id,
                                 args.clone(),
@@ -585,7 +585,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
                         {
                             location.statement_index = 0;
                             location.block = destination.unwrap().1;
-                            self.add_instrumentation(
+                            self.add_instrumentation_point(
                                 location,
                                 arg_fn,
                                 vec![Operand::Copy(destination.unwrap().0)],
@@ -606,7 +606,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for FunctionInstrumenter<'a, 'tcx> {
             TerminatorKind::Return => {
                 let place = Place::return_place();
                 if self.body.local_decls[place.local].ty.is_unsafe_ptr() {
-                    self.add_instrumentation(
+                    self.add_instrumentation_point(
                         location,
                         ret_fn,
                         vec![Operand::Copy(place)],
@@ -643,7 +643,7 @@ fn make_const<'tcx>(tcx: TyCtxt<'tcx>, idx: u32) -> Operand<'tcx> {
     }))
 }
 
-fn instrument<'tcx>(
+fn instrument_body<'tcx>(
     state: &InstrumentMemoryOps,
     tcx: TyCtxt<'tcx>,
     body: &mut Body<'tcx>,
@@ -663,28 +663,30 @@ fn instrument<'tcx>(
         index: CRATE_DEF_INDEX,
     };
 
-    let mut instrumenter = FunctionInstrumenter {
+    let mut collect_points = CollectFunctionInstrumentationPoints {
         tcx,
         body,
         runtime_crate_did,
 
         instrumentation_points: RefCell::new(vec![]),
     };
-    let main_did = tcx.entry_fn(()).map(|(def_id, _)| def_id);
-    instrumenter.visit_body(body);
-    do_instrumentation(
+    collect_points.visit_body(body);
+    apply_instrumentation(
         state,
-        &instrumenter.into_instrumentation_points(),
+        &collect_points.into_instrumentation_points(),
         tcx,
         body,
         body_def_hash,
     );
 
+    // Apply `main`-specific instrumentation if this fn is main
+    let main_did = tcx.entry_fn(()).map(|(def_id, _)| def_id);
     if Some(body_did) == main_did {
         instrument_entry_fn(tcx, runtime_crate_did, body);
     }
 }
 
+/// Add initialization code to the body of a function known to be the binary entrypoint
 fn instrument_entry_fn<'tcx>(tcx: TyCtxt<'tcx>, runtime_crate_did: DefId, body: &mut Body<'tcx>) {
     let init_fn_did =
         find_instrumentation_def(tcx, runtime_crate_did, Symbol::intern("initialize"))
@@ -717,7 +719,8 @@ fn instrument_entry_fn<'tcx>(tcx: TyCtxt<'tcx>, runtime_crate_did: DefId, body: 
     }
 }
 
-fn do_instrumentation<'tcx>(
+/// Rewrite the body to apply the specified instrumentation points
+fn apply_instrumentation<'tcx>(
     state: &InstrumentMemoryOps,
     points: &[InstrumentationPoint<'tcx>],
     tcx: TyCtxt<'tcx>,
