@@ -208,7 +208,7 @@ fn to_mir_place<'tcx>(place: &Place<'tcx>) -> MirPlace {
 }
 
 // gets the one and only input Place, if applicable
-fn rv_place<'tcx>(rv: &'tcx Rvalue) -> Option<Place<'tcx>> {
+fn rv_place<'tcx>(rv: &Rvalue<'tcx>) -> Option<Place<'tcx>> {
     match rv {
         Rvalue::Use(op) => op.place(),
         Rvalue::Repeat(op, _) => op.place(),
@@ -521,6 +521,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for CollectFunctionInstrumentationPoints<'a, 't
                 func,
                 args,
                 destination,
+                target,
                 ..
             } => {
                 let mut arg_idx: usize = 1;
@@ -564,7 +565,7 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for CollectFunctionInstrumentationPoints<'a, 't
                     }
                 }
                 if let ty::FnDef(def_id, _) = func.ty(self.body, self.tcx).kind() {
-                    if destination.is_some() {
+                    if true {
                         println!("term: {:?}", terminator.kind);
                         let fn_name = self.tcx.item_name(*def_id);
                         // println!(
@@ -576,11 +577,10 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for CollectFunctionInstrumentationPoints<'a, 't
                             let func_def_id = self
                                 .find_instrumentation_def(fn_name)
                                 .expect("Could not find instrumentation hook function");
-
                             self.add_instrumentation_point(
                                 location,
                                 func_def_id,
-                                args.iter().map(|arg| InstrumentationOperand::Place(*arg)).collect(),
+                                args.iter().map(|arg| InstrumentationOperand::Place(arg.clone())).collect(),
                                 false,
                                 true,
                                 EventMetadata {
@@ -591,28 +591,26 @@ impl<'a, 'tcx: 'a> Visitor<'tcx> for CollectFunctionInstrumentationPoints<'a, 't
                                         .map(|op| to_mir_place(&op.place().unwrap()))
                                         .next(),
                                     // FIXME: hooks have sources
-                                    destination: destination.map(|d| to_mir_place(&d.0)),
+                                    destination: Some(to_mir_place(destination)),
                                     transfer_kind: TransferKind::Ret(self.func_hash()),
                                 },
                             );
                         } else if destination
-                            .unwrap()
-                            .0
                             .ty(&self.body.local_decls, self.tcx)
                             .ty
                             .is_unsafe_ptr()
                         {
                             location.statement_index = 0;
-                            location.block = destination.unwrap().1;
+                            location.block = target.unwrap();
                             self.add_instrumentation_point(
                                 location,
                                 arg_fn,
-                                vec![InstrumentationOperand::RawPtr(Operand::Copy(destination.unwrap().0))],
+                                vec![InstrumentationOperand::RawPtr(Operand::Copy(*destination))],
                                 false,
                                 false,
                                 EventMetadata {
                                     source: Some(to_mir_place(&Local::from_u32(0).into())),
-                                    destination: destination.map(|d| to_mir_place(&d.0)),
+                                    destination: Some(to_mir_place(destination)),
                                     transfer_kind: TransferKind::Ret(
                                         self.tcx.def_path_hash(*def_id).0.as_value(),
                                     ),
@@ -767,7 +765,8 @@ fn apply_instrumentation<'tcx>(
         if after_call {
             let call = blocks[loc.block].terminator_mut();
             let ret_value = if let TerminatorKind::Call {
-                destination: Some((place, _next_block)),
+                destination: place,
+                //target: Some(_next_block),
                 args,
                 ..
             } = &mut call.kind
@@ -802,11 +801,11 @@ fn apply_instrumentation<'tcx>(
             let orig_call = blocks[successor_block].terminator_mut();
             if let (
                 TerminatorKind::Call {
-                    destination: Some((_, instrument_dest)),
+                    target: instrument_dest,
                     ..
                 },
                 TerminatorKind::Call {
-                    destination: Some((_, orig_dest)),
+                    target: orig_dest,
                     ..
                 },
             ) = (&mut instrument_call.kind, &mut orig_call.kind)
@@ -874,7 +873,8 @@ fn insert_call<'tcx>(
         kind: TerminatorKind::Call {
             func,
             args: args.iter().map(|arg| arg.inner()).collect(),
-            destination: Some((ret_local.into(), successor_block)),
+            destination: ret_local.into(),
+            target: Some(successor_block),
             cleanup: None,
             from_hir_call: true,
             fn_span: DUMMY_SP,
