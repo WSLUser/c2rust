@@ -9,6 +9,7 @@ use std::convert::TryInto;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::slice;
 
 /// The actual data for a labeled type.
 ///
@@ -51,6 +52,53 @@ impl<'tcx, L: Copy> LabeledTyS<'tcx, L> {
         callback(self.label);
         for &arg in self.args {
             arg.for_each_label(callback);
+        }
+    }
+}
+
+impl<'tcx, L> LabeledTyS<'tcx, L> {
+    pub fn iter(&'tcx self) -> LabeledTyIter<'tcx, L> {
+        LabeledTyIter::new(self)
+    }
+}
+
+pub struct LabeledTyIter<'tcx, L> {
+    root: Option<LabeledTy<'tcx, L>>,
+    stack: Vec<slice::Iter<'tcx, LabeledTy<'tcx, L>>>,
+}
+
+impl<'tcx, L> LabeledTyIter<'tcx, L> {
+    fn new(lty: LabeledTy<'tcx, L>) -> LabeledTyIter<'tcx, L> {
+        LabeledTyIter {
+            root: Some(lty),
+            stack: Vec::new(),
+        }
+    }
+}
+
+impl<'tcx, L> Iterator for LabeledTyIter<'tcx, L> {
+    type Item = LabeledTy<'tcx, L>;
+
+    fn next(&mut self) -> Option<LabeledTy<'tcx, L>> {
+        if let Some(lty) = self.root.take() {
+            if !lty.args.is_empty() {
+                self.stack.push(lty.args.iter());
+            }
+            return Some(lty);
+        }
+
+        loop {
+            match self.stack.last_mut()?.next() {
+                Some(lty) => {
+                    if !lty.args.is_empty() {
+                        self.stack.push(lty.args.iter());
+                    }
+                    return Some(lty);
+                }
+                None => {
+                    self.stack.pop();
+                }
+            }
         }
     }
 }
@@ -105,7 +153,7 @@ impl<'tcx, L: Copy> LabeledTyCtxt<'tcx, L> {
     /// Label a `Ty` using a callback.  The callback runs at every type constructor to produce a
     /// label for that node in the tree.
     pub fn label<F: FnMut(Ty<'tcx>) -> L>(&self, ty: Ty<'tcx>, f: &mut F) -> LabeledTy<'tcx, L> {
-        use rustc_middle::ty::TyKind::*;
+        use rustc_type_ir::TyKind::*;
         let label = f(ty);
         match ty.kind() {
             // Types with no arguments
@@ -118,11 +166,11 @@ impl<'tcx, L: Copy> LabeledTyCtxt<'tcx, L> {
                 let args = substs.types().map(|t| self.label(t, f)).collect::<Vec<_>>();
                 self.mk(ty, self.mk_slice(&args), label)
             }
-            Array(elem, _) => {
+            &Array(elem, _) => {
                 let args = [self.label(elem, f)];
                 self.mk(ty, self.mk_slice(&args), label)
             }
-            Slice(elem) => {
+            &Slice(elem) => {
                 let args = [self.label(elem, f)];
                 self.mk(ty, self.mk_slice(&args), label)
             }
@@ -130,7 +178,7 @@ impl<'tcx, L: Copy> LabeledTyCtxt<'tcx, L> {
                 let args = [self.label(mty.ty, f)];
                 self.mk(ty, self.mk_slice(&args), label)
             }
-            Ref(_, mty, _) => {
+            &Ref(_, mty, _) => {
                 let args = [self.label(mty, f)];
                 self.mk(ty, self.mk_slice(&args), label)
             }
@@ -151,10 +199,7 @@ impl<'tcx, L: Copy> LabeledTyCtxt<'tcx, L> {
                 self.mk(ty, self.mk_slice(&args), label)
             }
             Tuple(elems) => {
-                let args = elems
-                    .types()
-                    .map(|ty| self.label(ty, f))
-                    .collect::<Vec<_>>();
+                let args = elems.iter().map(|ty| self.label(ty, f)).collect::<Vec<_>>();
                 self.mk(ty, self.mk_slice(&args), label)
             }
 
@@ -172,7 +217,7 @@ impl<'tcx, L: Copy> LabeledTyCtxt<'tcx, L> {
     where
         F: FnMut(Ty<'tcx>) -> L,
     {
-        self.mk_slice(&tys.iter().map(|ty| self.label(ty, f)).collect::<Vec<_>>())
+        self.mk_slice(&tys.iter().map(|&ty| self.label(ty, f)).collect::<Vec<_>>())
     }
 
     /// Substitute in arguments for any type parameter references (`Param`) in a labeled type.
@@ -243,7 +288,7 @@ impl<'tcx, L: Copy> LabeledTyCtxt<'tcx, L> {
     where
         F: FnMut(Ty<'tcx>, &[Ty<'tcx>], L) -> Ty<'tcx>,
     {
-        use rustc_middle::ty::TyKind::*;
+        use rustc_type_ir::TyKind::*;
         let args = lty
             .args
             .iter()
